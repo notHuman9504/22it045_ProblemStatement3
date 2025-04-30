@@ -5,6 +5,9 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:convert';
 import 'firebase_options.dart';
 
 void main() async {
@@ -83,6 +86,50 @@ class Todo {
   }
 }
 
+// Class to represent queued operations for offline sync
+class QueuedOperation {
+  final String operationType; // 'add', 'delete', 'toggle', 'edit'
+  final String todoId;
+  final Todo? todo; // Used for add/edit operations
+  final DateTime timestamp;
+
+  QueuedOperation({
+    required this.operationType,
+    required this.todoId,
+    this.todo,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+
+  // Convert to Map for storage
+  Map<String, dynamic> toMap() {
+    return {
+      'operationType': operationType,
+      'todoId': todoId,
+      'todo': todo?.toMap(),
+      'timestamp': timestamp.millisecondsSinceEpoch,
+    };
+  }
+
+  // Create from Map
+  factory QueuedOperation.fromMap(Map<String, dynamic> map) {
+    return QueuedOperation(
+      operationType: map['operationType'],
+      todoId: map['todoId'],
+      todo: map['todo'] != null ? Todo(
+        id: map['todo']['id'],
+        title: map['todo']['title'],
+        completed: map['todo']['completed'],
+        createdAt: DateTime.fromMillisecondsSinceEpoch(
+          (map['todo']['createdAt'] is Timestamp) 
+              ? (map['todo']['createdAt'] as Timestamp).millisecondsSinceEpoch 
+              : map['todo']['createdAt']
+        ),
+      ) : null,
+      timestamp: DateTime.fromMillisecondsSinceEpoch(map['timestamp']),
+    );
+  }
+}
+
 // Provider for state management with Firestore and local fallback
 class TodoModel extends ChangeNotifier {
   final List<Todo> _todos = [];
@@ -91,13 +138,144 @@ class TodoModel extends ChangeNotifier {
   bool _isLoading = true;
   String? _error;
   bool _useLocalStorage = false; // Flag to use local storage instead of Firestore
+  List<QueuedOperation> _operationQueue = []; // Queue for offline operations
+  bool _isSyncing = false; // Flag to track if syncing is in progress
+  final Connectivity _connectivity = Connectivity(); // For monitoring connectivity
+  bool _isOffline = false; // Current connectivity status
 
   List<Todo> get todos => List.from(_todos);
   bool get isLoading => _isLoading;
   String? get error => _error;
+  bool get isSyncing => _isSyncing;
+  bool get isOffline => _isOffline;
+  int get pendingOperationsCount => _operationQueue.length;
 
   TodoModel() {
+    _loadQueuedOperations();
+    _initConnectivity();
     _fetchTodos();
+  }
+
+  // Load any previously queued operations from local storage
+  Future<void> _loadQueuedOperations() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final queuedOpsJson = prefs.getString('queued_operations');
+      if (queuedOpsJson != null) {
+        final List<dynamic> queuedOpsList = jsonDecode(queuedOpsJson);
+        _operationQueue = queuedOpsList
+            .map((op) => QueuedOperation.fromMap(op))
+            .toList();
+        print('Loaded ${_operationQueue.length} queued operations from storage');
+      }
+    } catch (e) {
+      print('Failed to load queued operations: $e');
+    }
+  }
+
+  // Save queued operations to local storage
+  Future<void> _saveQueuedOperations() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final queuedOpsJson = jsonEncode(
+        _operationQueue.map((op) => op.toMap()).toList()
+      );
+      await prefs.setString('queued_operations', queuedOpsJson);
+    } catch (e) {
+      print('Failed to save queued operations: $e');
+    }
+  }
+
+  // Initialize connectivity monitoring
+  void _initConnectivity() {
+    _connectivity.checkConnectivity().then((result) {
+      _isOffline = result == ConnectivityResult.none;
+      if (!_isOffline) {
+        _syncQueuedOperations();
+      }
+    });
+
+    // Listen for connectivity changes
+    _connectivity.onConnectivityChanged.listen((result) {
+      final wasOffline = _isOffline;
+      _isOffline = result == ConnectivityResult.none;
+      
+      // If we're coming back online, try to sync
+      if (wasOffline && !_isOffline) {
+        print('Connectivity restored - attempting to sync queued operations');
+        _syncQueuedOperations();
+      }
+    });
+  }
+
+  // Sync queued operations with Firestore
+  Future<void> _syncQueuedOperations() async {
+    if (_operationQueue.isEmpty || _isSyncing || _isOffline) {
+      return;
+    }
+
+    _isSyncing = true;
+    notifyListeners();
+
+    try {
+      print('Starting sync of ${_operationQueue.length} queued operations');
+      
+      // Process operations in the order they were added
+      List<QueuedOperation> completedOps = [];
+      
+      for (final op in _operationQueue) {
+        try {
+          switch (op.operationType) {
+            case 'add':
+              if (op.todo != null) {
+                await _todosCollection.doc(op.todoId).set(op.todo!.toMap());
+                print('Synced ADD operation for todo: ${op.todoId}');
+              }
+              break;
+            case 'delete':
+              await _todosCollection.doc(op.todoId).delete();
+              print('Synced DELETE operation for todo: ${op.todoId}');
+              break;
+            case 'toggle':
+              if (op.todo != null) {
+                await _todosCollection.doc(op.todoId).update({
+                  'completed': op.todo!.completed
+                });
+                print('Synced TOGGLE operation for todo: ${op.todoId}');
+              }
+              break;
+            case 'edit':
+              if (op.todo != null) {
+                await _todosCollection.doc(op.todoId).update({
+                  'title': op.todo!.title
+                });
+                print('Synced EDIT operation for todo: ${op.todoId}');
+              }
+              break;
+          }
+          completedOps.add(op);
+        } catch (e) {
+          print('Failed to sync operation ${op.operationType} for todo ${op.todoId}: $e');
+          // If one operation fails, continue with others
+        }
+      }
+      
+      // Remove completed operations from the queue
+      _operationQueue.removeWhere((op) => completedOps.contains(op));
+      await _saveQueuedOperations();
+      
+      print('Sync completed. ${completedOps.length} operations processed, ${_operationQueue.length} remaining');
+      
+      // Fetch fresh data after sync
+      if (completedOps.isNotEmpty) {
+        _fetchTodos();
+      }
+    } catch (e) {
+      print('Error during sync operation: $e');
+    } finally {
+      _isSyncing = false;
+      notifyListeners();
+    }
   }
 
   // Fetch todos from Firestore
@@ -106,13 +284,14 @@ class TodoModel extends ChangeNotifier {
     notifyListeners();
 
     try {
-      if (!_useLocalStorage) {
+      if (!_isOffline) {
         final QuerySnapshot snapshot = await _todosCollection.orderBy('createdAt', descending: true).get();
         _todos.clear();
         for (var doc in snapshot.docs) {
           _todos.add(Todo.fromFirestore(doc as DocumentSnapshot<Map<String, dynamic>>));
         }
         _error = null;
+        _useLocalStorage = false;
         startListening(); // Start real-time listener
       }
     } catch (e) {
@@ -125,9 +304,21 @@ class TodoModel extends ChangeNotifier {
     }
   }
 
+  // Queue an operation for offline sync
+  void _queueOperation(QueuedOperation operation) {
+    _operationQueue.add(operation);
+    _saveQueuedOperations();
+    notifyListeners();
+    
+    // Try to sync immediately if we think we're online
+    if (!_isOffline) {
+      _syncQueuedOperations();
+    }
+  }
+
   // Listen to real-time updates
   void startListening() {
-    if (_useLocalStorage) return; // Don't listen if using local storage
+    if (_useLocalStorage || _isOffline) return; // Don't listen if using local storage or offline
     
     try {
       _todosCollection.orderBy('createdAt', descending: true).snapshots().listen((snapshot) {
@@ -140,11 +331,13 @@ class TodoModel extends ChangeNotifier {
         print('Error listening to todos: $e');
         _error = 'Error listening to todos: $e';
         _useLocalStorage = true; // Fall back to local storage
+        _isOffline = true; // Mark as offline since we can't listen
         notifyListeners();
       });
     } catch (e) {
       print('Failed to set up listener: $e');
       _useLocalStorage = true; // Fall back to local storage
+      _isOffline = true; // Mark as offline
       notifyListeners();
     }
   }
@@ -157,20 +350,33 @@ class TodoModel extends ChangeNotifier {
         title: title.trim(),
       );
       
-      if (!_useLocalStorage) {
+      // Add to local list immediately for responsive UI
+      _todos.add(newTodo);
+      notifyListeners();
+      
+      if (_isOffline || _useLocalStorage) {
+        // Queue operation for later sync
+        _queueOperation(QueuedOperation(
+          operationType: 'add',
+          todoId: newTodo.id,
+          todo: newTodo,
+        ));
+      } else {
         try {
           await _todosCollection.doc(newTodo.id).set(newTodo.toMap());
-          // No need to update local list as the listener will handle it
+          // Real-time listener will update the list
         } catch (e) {
           print('Failed to add todo to Firestore: $e');
           _useLocalStorage = true; // Fall back to local storage
-          _todos.add(newTodo); // Add to local list instead
-          notifyListeners();
+          _isOffline = true; // Assume we're offline
+          
+          // Queue operation for later sync
+          _queueOperation(QueuedOperation(
+            operationType: 'add',
+            todoId: newTodo.id,
+            todo: newTodo,
+          ));
         }
-      } else {
-        // Add to local list only
-        _todos.add(newTodo);
-        notifyListeners();
       }
     }
   }
@@ -179,21 +385,33 @@ class TodoModel extends ChangeNotifier {
   Future<void> toggleTodo(String id) async {
     final todoIndex = _todos.indexWhere((todo) => todo.id == id);
     if (todoIndex >= 0) {
-      if (!_useLocalStorage) {
+      // Update local state immediately
+      _todos[todoIndex].completed = !_todos[todoIndex].completed;
+      notifyListeners();
+      
+      if (_isOffline || _useLocalStorage) {
+        // Queue operation for later sync
+        _queueOperation(QueuedOperation(
+          operationType: 'toggle',
+          todoId: id,
+          todo: _todos[todoIndex],
+        ));
+      } else {
         try {
-          final bool newStatus = !_todos[todoIndex].completed;
-          await _todosCollection.doc(id).update({'completed': newStatus});
-          // No need to update local list as the listener will handle it
+          await _todosCollection.doc(id).update({'completed': _todos[todoIndex].completed});
+          // Real-time listener will update the list
         } catch (e) {
           print('Failed to update todo in Firestore: $e');
           _useLocalStorage = true; // Fall back to local storage
-          _todos[todoIndex].completed = !_todos[todoIndex].completed;
-          notifyListeners();
+          _isOffline = true; // Assume we're offline
+          
+          // Queue operation for later sync
+          _queueOperation(QueuedOperation(
+            operationType: 'toggle',
+            todoId: id,
+            todo: _todos[todoIndex],
+          ));
         }
-      } else {
-        // Update local list only
-        _todos[todoIndex].completed = !_todos[todoIndex].completed;
-        notifyListeners();
       }
     }
   }
@@ -203,20 +421,33 @@ class TodoModel extends ChangeNotifier {
     if (newTitle.trim().isNotEmpty) {
       final todoIndex = _todos.indexWhere((todo) => todo.id == id);
       if (todoIndex >= 0) {
-        if (!_useLocalStorage) {
+        // Update local state immediately
+        _todos[todoIndex].title = newTitle.trim();
+        notifyListeners();
+        
+        if (_isOffline || _useLocalStorage) {
+          // Queue operation for later sync
+          _queueOperation(QueuedOperation(
+            operationType: 'edit',
+            todoId: id,
+            todo: _todos[todoIndex],
+          ));
+        } else {
           try {
             await _todosCollection.doc(id).update({'title': newTitle.trim()});
-            // No need to update local list as the listener will handle it
+            // Real-time listener will update the list
           } catch (e) {
             print('Failed to edit todo in Firestore: $e');
             _useLocalStorage = true; // Fall back to local storage
-            _todos[todoIndex].title = newTitle.trim();
-            notifyListeners();
+            _isOffline = true; // Assume we're offline
+            
+            // Queue operation for later sync
+            _queueOperation(QueuedOperation(
+              operationType: 'edit',
+              todoId: id,
+              todo: _todos[todoIndex],
+            ));
           }
-        } else {
-          // Update local list only
-          _todos[todoIndex].title = newTitle.trim();
-          notifyListeners();
         }
       }
     }
@@ -224,21 +455,46 @@ class TodoModel extends ChangeNotifier {
 
   // Delete a todo
   Future<void> deleteTodo(String id) async {
-    if (!_useLocalStorage) {
+    // Remove from local list immediately for responsive UI
+    final deletedTodoIndex = _todos.indexWhere((todo) => todo.id == id);
+    Todo? deletedTodo;
+    if (deletedTodoIndex >= 0) {
+      deletedTodo = _todos[deletedTodoIndex];
+      _todos.removeAt(deletedTodoIndex);
+      notifyListeners();
+    }
+    
+    if (_isOffline || _useLocalStorage) {
+      // Queue operation for later sync
+      _queueOperation(QueuedOperation(
+        operationType: 'delete',
+        todoId: id,
+        todo: deletedTodo,
+      ));
+    } else {
       try {
         await _todosCollection.doc(id).delete();
-        // No need to update local list as the listener will handle it
+        // Real-time listener will update the list
       } catch (e) {
         print('Failed to delete todo from Firestore: $e');
         _useLocalStorage = true; // Fall back to local storage
-        _todos.removeWhere((todo) => todo.id == id);
-        notifyListeners();
+        _isOffline = true; // Assume we're offline
+        
+        // Queue operation for later sync
+        if (deletedTodo != null) {
+          _queueOperation(QueuedOperation(
+            operationType: 'delete',
+            todoId: id,
+            todo: deletedTodo,
+          ));
+        }
       }
-    } else {
-      // Update local list only
-      _todos.removeWhere((todo) => todo.id == id);
-      notifyListeners();
     }
+  }
+
+  // Force a sync attempt (can be called manually by the user)
+  Future<void> forceSyncQueuedOperations() async {
+    await _syncQueuedOperations();
   }
 }
 
@@ -272,34 +528,168 @@ class _TodoListState extends State<TodoList> {
         backgroundColor: Theme.of(context).colorScheme.primary,
         foregroundColor: Colors.white,
         elevation: 0,
+        actions: [
+          // Add a sync button
+          Consumer<TodoModel>(
+            builder: (context, todoModel, child) {
+              if (todoModel.pendingOperationsCount > 0) {
+                return IconButton(
+                  icon: Stack(
+                    children: [
+                      const Icon(Icons.sync),
+                      Positioned(
+                        right: 0,
+                        top: 0,
+                        child: Container(
+                          padding: const EdgeInsets.all(1),
+                          decoration: BoxDecoration(
+                            color: Colors.red,
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          constraints: const BoxConstraints(
+                            minWidth: 12,
+                            minHeight: 12,
+                          ),
+                          child: Text(
+                            '${todoModel.pendingOperationsCount}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 8,
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  tooltip: 'Sync ${todoModel.pendingOperationsCount} pending operations',
+                  onPressed: todoModel.isSyncing
+                      ? null
+                      : () => todoModel.forceSyncQueuedOperations(),
+                );
+              }
+              return const SizedBox.shrink();
+            },
+          ),
+        ],
       ),
       body: Column(
         children: [
           const AddTodoForm(),
           Consumer<TodoModel>(
             builder: (context, todoModel, child) {
-              if (todoModel.error != null) {
-                return Container(
-                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
-                  color: Colors.orange.shade100,
-                  child: Row(
-                    children: [
-                      Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Using local storage (Firebase error: ${todoModel.error})',
-                          style: TextStyle(
-                            color: Colors.orange.shade800,
-                            fontSize: 12,
+              List<Widget> statusWidgets = [];
+              
+              // Offline status indicator
+              if (todoModel.isOffline) {
+                statusWidgets.add(
+                  Container(
+                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+                    color: Colors.orange.shade100,
+                    child: Row(
+                      children: [
+                        Icon(Icons.wifi_off, color: Colors.orange.shade800),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Offline mode - changes will sync when connection is restored',
+                            style: TextStyle(
+                              color: Colors.orange.shade800,
+                              fontSize: 12,
+                            ),
                           ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 );
               }
-              return const SizedBox.shrink();
+              
+              // Error status
+              if (todoModel.error != null) {
+                statusWidgets.add(
+                  Container(
+                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+                    color: Colors.orange.shade100,
+                    child: Row(
+                      children: [
+                        Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Using local storage (Firebase error: ${todoModel.error})',
+                            style: TextStyle(
+                              color: Colors.orange.shade800,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }
+              
+              // Syncing status
+              if (todoModel.isSyncing) {
+                statusWidgets.add(
+                  Container(
+                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+                    color: Colors.blue.shade100,
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: 16, 
+                          height: 16, 
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(Colors.blue.shade800),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Syncing ${todoModel.pendingOperationsCount} operations...',
+                            style: TextStyle(
+                              color: Colors.blue.shade800,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }
+              
+              // Pending operations
+              else if (todoModel.pendingOperationsCount > 0 && !todoModel.isOffline) {
+                statusWidgets.add(
+                  Container(
+                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+                    color: Colors.blue.shade50,
+                    child: Row(
+                      children: [
+                        Icon(Icons.sync, color: Colors.blue.shade800),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '${todoModel.pendingOperationsCount} pending operations - tap sync icon to force sync',
+                            style: TextStyle(
+                              color: Colors.blue.shade800,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }
+              
+              return Column(
+                children: statusWidgets,
+              );
             },
           ),
           const SizedBox(height: 20),
