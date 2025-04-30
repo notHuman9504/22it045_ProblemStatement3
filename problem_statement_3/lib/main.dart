@@ -3,6 +3,8 @@ import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:flutter_tts/flutter_tts.dart';
 import 'firebase_options.dart';
 
 void main() async {
@@ -365,10 +367,176 @@ class AddTodoForm extends StatefulWidget {
 class _AddTodoFormState extends State<AddTodoForm> {
   final _controller = TextEditingController();
   bool _isSubmitting = false;
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  final FlutterTts _flutterTts = FlutterTts();
+  
+  bool _isListening = false;
+  bool _isContinuousListening = false;
+  String _lastWords = '';
+  String _rawRecognizedWords = '';
+  bool _speechAvailable = false;
+  bool _isRecordingTodo = false;
+  String _statusText = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _initSpeech();
+    _initTts();
+  }
+
+  // Initialize text-to-speech
+  void _initTts() async {
+    await _flutterTts.setLanguage('en-US');
+    await _flutterTts.setPitch(1.0);
+    await _flutterTts.setSpeechRate(0.5);
+  }
+
+  // Speak feedback to the user
+  Future<void> _speak(String text) async {
+    await _flutterTts.speak(text);
+  }
+
+  // Initialize speech recognition
+  void _initSpeech() async {
+    _speechAvailable = await _speech.initialize(
+      onStatus: (status) {
+        print('Speech recognition status: $status');
+        if (status == 'done' || status == 'notListening') {
+          // In continuous mode, restart listening when it stops
+          if (_isContinuousListening && mounted) {
+            Future.delayed(const Duration(milliseconds: 500), () {
+              _startListening(continuous: true);
+            });
+          } else if (mounted) {
+            setState(() {
+              _isListening = false;
+            });
+          }
+        }
+      },
+      onError: (error) {
+        print('Speech recognition error: $error');
+        if (_isContinuousListening && mounted) {
+          Future.delayed(const Duration(seconds: 2), () {
+            _startListening(continuous: true);
+          });
+        }
+      },
+    );
+    setState(() {});
+  }
+
+  // Listen for speech input
+  void _startListening({bool continuous = false}) async {
+    if (!_speechAvailable) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Speech recognition not available on this device'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
+    // If already listening, stop
+    if (_isListening && !continuous) {
+      await _speech.stop();
+      setState(() {
+        _isListening = false;
+        _isContinuousListening = false;
+      });
+      return;
+    }
+
+    // Clear status for new listening session
+    setState(() {
+      _isListening = true;
+      _isContinuousListening = continuous;
+      if (!_isRecordingTodo) {
+        _lastWords = '';
+        _rawRecognizedWords = '';
+      }
+      _statusText = continuous ? 'Listening for commands...' : 'Listening...';
+    });
+
+    await _speech.listen(
+      onResult: (result) {
+        setState(() {
+          // Save the raw recognized words
+          _rawRecognizedWords = result.recognizedWords;
+          
+          // Process the recognized words
+          String recognizedWords = result.recognizedWords.toLowerCase();
+          
+          if (_isContinuousListening) {
+            // In continuous mode, look for commands
+            if (recognizedWords.contains('123') && !_isRecordingTodo) {
+              _speak('Recording your todo');
+              _isRecordingTodo = true;
+              _lastWords = '';
+              _statusText = 'Recording todo... Say "456" when finished';
+            } else if (recognizedWords.contains('456')) {
+              if (_isRecordingTodo && _lastWords.isNotEmpty) {
+                // Clean up command triggers from the recorded text
+                String todoText = _lastWords.replaceAll('123', '')
+                                         .replaceAll('456', '')
+                                         .trim();
+                
+                if (todoText.isNotEmpty) {
+                  _controller.text = todoText;
+                  _handleSubmit();
+                  _speak('Added todo: $todoText');
+                }
+                _isRecordingTodo = false;
+                _lastWords = '';
+                _statusText = 'Listening for commands...';
+              }
+            } else if (_isRecordingTodo) {
+              // Append words while recording todo
+              _lastWords = recognizedWords;
+              _controller.text = _lastWords;
+            }
+          } else {
+            // Regular speech mode, just capture words
+            _lastWords = recognizedWords;
+            _controller.text = _lastWords;
+          }
+        });
+      },
+      listenFor: continuous ? const Duration(seconds: 30) : const Duration(seconds: 30),
+      pauseFor: continuous ? const Duration(seconds: 2) : const Duration(seconds: 5),
+      partialResults: true,
+      localeId: 'en_US',
+      cancelOnError: false,
+    );
+  }
+
+  // Toggle continuous listening mode
+  void _toggleContinuousListening() {
+    if (_isContinuousListening) {
+      _speech.stop();
+      setState(() {
+        _isListening = false;
+        _isContinuousListening = false;
+        _isRecordingTodo = false;
+        _statusText = '';
+      });
+      _speak('Voice assistant deactivated');
+    } else {
+      setState(() {
+        _statusText = 'Starting voice assistant...';
+      });
+      _speak('Voice assistant activated. Say "123" to create a new task');
+      _startListening(continuous: true);
+    }
+  }
 
   @override
   void dispose() {
     _controller.dispose();
+    _speech.stop();
+    _flutterTts.stop();
     super.dispose();
   }
 
@@ -414,52 +582,174 @@ class _AddTodoFormState extends State<AddTodoForm> {
           ),
         ],
       ),
-      child: Row(
+      child: Column(
         children: [
-          Expanded(
-            child: TextField(
-              controller: _controller,
-              decoration: InputDecoration(
-                hintText: 'Add a new task...',
-                hintStyle: TextStyle(color: Colors.grey.shade400),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide.none,
-                ),
-                filled: true,
-                fillColor: Colors.grey.shade50,
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 16,
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _controller,
+                  decoration: InputDecoration(
+                    hintText: _isListening 
+                      ? (_isRecordingTodo ? 'Recording todo...' : 'Listening...') 
+                      : 'Add a new task...',
+                    hintStyle: TextStyle(
+                      color: _isRecordingTodo 
+                        ? Colors.red.shade400 
+                        : (_isListening ? Colors.green.shade400 : Colors.grey.shade400),
+                    ),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                    filled: true,
+                    fillColor: Colors.grey.shade50,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 16,
+                    ),
+                    suffixIcon: _controller.text.isNotEmpty
+                        ? IconButton(
+                            icon: const Icon(Icons.clear),
+                            onPressed: () {
+                              _controller.clear();
+                              setState(() {});
+                            },
+                          )
+                        : null,
+                  ),
+                  onSubmitted: (_) => _handleSubmit(),
+                  enabled: !_isSubmitting && !_isRecordingTodo,
+                  onChanged: (_) => setState(() {}),
                 ),
               ),
-              onSubmitted: (_) => _handleSubmit(),
-              enabled: !_isSubmitting,
-            ),
+              const SizedBox(width: 12),
+              Container(
+                decoration: BoxDecoration(
+                  color: _isContinuousListening
+                      ? Colors.deepPurple.shade400
+                      : (_isListening
+                          ? Colors.green.shade400
+                          : Theme.of(context).colorScheme.secondary),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: IconButton(
+                  onPressed: _speechAvailable ? _toggleContinuousListening : null,
+                  icon: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 300),
+                    child: _isContinuousListening
+                        ? const Icon(
+                            Icons.record_voice_over,
+                            key: ValueKey('continuous'),
+                          )
+                        : const Icon(
+                            Icons.voice_over_off,
+                            key: ValueKey('not_continuous'),
+                          ),
+                  ),
+                  color: Colors.white,
+                  tooltip: _isContinuousListening
+                      ? 'Voice assistant active (tap to deactivate)'
+                      : 'Activate voice assistant',
+                ),
+              ),
+              const SizedBox(width: 12),
+              Container(
+                decoration: BoxDecoration(
+                  color: _isListening && !_isContinuousListening
+                      ? Colors.green.shade400
+                      : Theme.of(context).colorScheme.secondary,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: IconButton(
+                  onPressed: _speechAvailable && !_isContinuousListening
+                      ? () => _startListening()
+                      : null,
+                  icon: Icon(
+                    _isListening && !_isContinuousListening ? Icons.mic : Icons.mic_none,
+                  ),
+                  color: Colors.white,
+                  tooltip: _isListening && !_isContinuousListening
+                      ? 'Stop listening'
+                      : 'Start voice input',
+                ),
+              ),
+              const SizedBox(width: 12),
+              Container(
+                decoration: BoxDecoration(
+                  color: _controller.text.trim().isNotEmpty
+                      ? Theme.of(context).colorScheme.primary
+                      : Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: IconButton(
+                  onPressed: _isSubmitting || _controller.text.trim().isEmpty
+                      ? null
+                      : _handleSubmit,
+                  icon: _isSubmitting
+                      ? const SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                          ),
+                        )
+                      : const Icon(Icons.add_rounded),
+                  color: Colors.white,
+                  iconSize: 28,
+                  tooltip: 'Add Task',
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 12),
-          Container(
-            decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.primary,
-              borderRadius: BorderRadius.circular(12),
+          if (_statusText.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8.0),
+              child: Text(
+                _statusText,
+                style: TextStyle(
+                  color: _isRecordingTodo
+                      ? Colors.red.shade700
+                      : (_isListening ? Colors.green.shade700 : Colors.grey.shade600),
+                  fontSize: 12,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
             ),
-            child: IconButton(
-              onPressed: _isSubmitting ? null : _handleSubmit,
-              icon: _isSubmitting 
-                ? const SizedBox(
-                    width: 24, 
-                    height: 24, 
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+          // Display the raw speech recognition text
+          if (_isListening && _rawRecognizedWords.isNotEmpty)
+            Container(
+              margin: const EdgeInsets.only(top: 10),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.grey.shade300),
+              ),
+              width: double.infinity,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Speech recognized:',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.grey.shade700,
                     ),
-                  )
-                : const Icon(Icons.add_rounded),
-              color: Colors.white,
-              iconSize: 28,
-              tooltip: 'Add Task',
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _rawRecognizedWords,
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: Colors.grey.shade800,
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
         ],
       ),
     );
