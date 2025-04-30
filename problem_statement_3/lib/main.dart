@@ -316,8 +316,8 @@ class _TodoListState extends State<TodoList> {
                 // Show empty state
                 if (todoModel.todos.isEmpty) {
                   return Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         Icon(
                           Icons.task_outlined,
@@ -344,7 +344,7 @@ class _TodoListState extends State<TodoList> {
                   itemCount: todoModel.todos.length,
                   itemBuilder: (context, index) {
                     final todo = todoModel.todos[index];
-                    return TodoItem(todo: todo);
+                    return TodoItem(todo: todo, index: index + 1);
                   },
                 );
               },
@@ -377,6 +377,9 @@ class _AddTodoFormState extends State<AddTodoForm> {
   bool _speechAvailable = false;
   bool _isRecordingTodo = false;
   String _statusText = '';
+  
+  // Operation mode
+  String _currentMode = 'none'; // 'none', 'add', 'delete'
 
   @override
   void initState() {
@@ -403,12 +406,7 @@ class _AddTodoFormState extends State<AddTodoForm> {
       onStatus: (status) {
         print('Speech recognition status: $status');
         if (status == 'done' || status == 'notListening') {
-          // In continuous mode, restart listening when it stops
-          if (_isContinuousListening && mounted) {
-            Future.delayed(const Duration(milliseconds: 500), () {
-              _startListening(continuous: true);
-            });
-          } else if (mounted) {
+          if (mounted) {
             setState(() {
               _isListening = false;
             });
@@ -417,18 +415,17 @@ class _AddTodoFormState extends State<AddTodoForm> {
       },
       onError: (error) {
         print('Speech recognition error: $error');
-        if (_isContinuousListening && mounted) {
-          Future.delayed(const Duration(seconds: 2), () {
-            _startListening(continuous: true);
-          });
-        }
+        setState(() {
+          _isListening = false;
+          _statusText = 'Speech recognition error. Please try again.';
+        });
       },
     );
     setState(() {});
   }
 
-  // Listen for speech input
-  void _startListening({bool continuous = false}) async {
+  // Start listening for add todo
+  void _startListeningForAddTodo() async {
     if (!_speechAvailable) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -439,96 +436,232 @@ class _AddTodoFormState extends State<AddTodoForm> {
       return;
     }
 
-    // If already listening, stop
-    if (_isListening && !continuous) {
-      await _speech.stop();
-      setState(() {
-        _isListening = false;
-        _isContinuousListening = false;
-      });
-      return;
-    }
-
-    // Clear status for new listening session
     setState(() {
       _isListening = true;
-      _isContinuousListening = continuous;
-      if (!_isRecordingTodo) {
-        _lastWords = '';
-        _rawRecognizedWords = '';
-      }
-      _statusText = continuous ? 'Listening for commands...' : 'Listening...';
+      _currentMode = 'add';
+      _lastWords = '';
+      _rawRecognizedWords = '';
+      _statusText = 'Speak your task...';
     });
 
     await _speech.listen(
       onResult: (result) {
         setState(() {
-          // Save the raw recognized words
           _rawRecognizedWords = result.recognizedWords;
-          
-          // Process the recognized words
-          String recognizedWords = result.recognizedWords.toLowerCase();
-          
-          if (_isContinuousListening) {
-            // In continuous mode, look for commands
-            if (recognizedWords.contains('123') && !_isRecordingTodo) {
-              _speak('Recording your todo');
-              _isRecordingTodo = true;
-              _lastWords = '';
-              _statusText = 'Recording todo... Say "456" when finished';
-            } else if (recognizedWords.contains('456')) {
-              if (_isRecordingTodo && _lastWords.isNotEmpty) {
-                // Clean up command triggers from the recorded text
-                String todoText = _lastWords.replaceAll('123', '')
-                                         .replaceAll('456', '')
-                                         .trim();
-                
-                if (todoText.isNotEmpty) {
-                  _controller.text = todoText;
-                  _handleSubmit();
-                  _speak('Added todo: $todoText');
-                }
-                _isRecordingTodo = false;
-                _lastWords = '';
-                _statusText = 'Listening for commands...';
-              }
-            } else if (_isRecordingTodo) {
-              // Append words while recording todo
-              _lastWords = recognizedWords;
-              _controller.text = _lastWords;
-            }
-          } else {
-            // Regular speech mode, just capture words
-            _lastWords = recognizedWords;
-            _controller.text = _lastWords;
-          }
+          _lastWords = result.recognizedWords;
+          _controller.text = _lastWords;
         });
       },
-      listenFor: continuous ? const Duration(seconds: 30) : const Duration(seconds: 30),
-      pauseFor: continuous ? const Duration(seconds: 2) : const Duration(seconds: 5),
+      listenFor: const Duration(seconds: 30),
+      pauseFor: const Duration(seconds: 5),
       partialResults: true,
       localeId: 'en_US',
       cancelOnError: false,
     );
   }
 
-  // Toggle continuous listening mode
-  void _toggleContinuousListening() {
-    if (_isContinuousListening) {
-      _speech.stop();
+  // Start listening for delete todo
+  void _startListeningForDeleteTodo() async {
+    if (!_speechAvailable) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Speech recognition not available on this device'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
+    final todoModel = Provider.of<TodoModel>(context, listen: false);
+    if (todoModel.todos.isEmpty) {
+      _speak('There are no todos to delete');
+      setState(() {
+        _statusText = 'There are no todos to delete';
+      });
+      return;
+    }
+
+    setState(() {
+      _isListening = true;
+      _currentMode = 'delete';
+      _lastWords = '';
+      _rawRecognizedWords = '';
+      _statusText = 'Say the number of the task to delete... For numbers like "123", only "3" will be used.';
+    });
+    
+    // Provide voice guidance
+    _speak('Which task number would you like to delete? For multi-digit numbers, only the last digits will be used.');
+
+    await _speech.listen(
+      onResult: (result) {
+        print("Speech result: '${result.recognizedWords}', Final: ${result.finalResult}");
+        
+        if (result.recognizedWords.isEmpty && !result.finalResult) {
+          // Don't update UI for empty partial results
+          return;
+        }
+        
+        setState(() {
+          _rawRecognizedWords = result.recognizedWords;
+          _lastWords = result.recognizedWords;
+          
+          // For very short utterances, try to process immediately if it looks like a number
+          if (result.finalResult && _isSingleNumber(result.recognizedWords)) {
+            _processDeleteCommand(result.recognizedWords);
+            _speech.stop();
+            _isListening = false;
+          }
+        });
+      },
+      listenFor: const Duration(seconds: 10),
+      pauseFor: const Duration(seconds: 2),
+      partialResults: true,
+      listenMode: stt.ListenMode.confirmation, // This mode is better for single words/numbers
+      localeId: 'en_US',
+      cancelOnError: false,
+    );
+  }
+  
+  // Check if the input is likely a single number
+  bool _isSingleNumber(String input) {
+    // Remove any spaces
+    final trimmed = input.trim();
+    
+    // Check if it's a digit
+    if (RegExp(r'^\d+$').hasMatch(trimmed)) {
+      // If it's a multi-digit number, we need to apply our trimming logic
+      if (trimmed.length > 2) {
+        // After trimming the first two digits, we should still have digits left
+        return trimmed.length > 2;
+      }
+      return true;
+    }
+    
+    // Check if it's a number word
+    const numberWords = ['one', 'two', 'three', 'four', 'five', 
+                        'six', 'seven', 'eight', 'nine', 'ten',
+                        'first', 'second', 'third', 'fourth', 'fifth',
+                        'sixth', 'seventh', 'eighth', 'ninth', 'tenth'];
+    
+    if (numberWords.contains(trimmed.toLowerCase())) {
+      return true;
+    }
+    
+    return false;
+  }
+
+  // Process the delete command
+  void _processDeleteCommand(String command) {
+    // Clean up the command for better number recognition
+    String cleanCommand = command.toLowerCase()
+        .replaceAll('delete', '')
+        .replaceAll('number', '')
+        .replaceAll('task', '')
+        .replaceAll('todo', '')
+        .replaceAll('item', '')
+        .replaceAll('the', '')
+        .trim();
+    
+    print('Processing delete command: "$command"');
+    print('Cleaned command: "$cleanCommand"');
+    
+    // Try multiple regex patterns to extract the number
+    int? taskNumber;
+    
+    // Pattern 1: Try extracting any standalone number
+    final RegExp digitRegex = RegExp(r'\b(\d+)\b');
+    final matches = digitRegex.allMatches(cleanCommand);
+    
+    if (matches.isNotEmpty) {
+      // Extract the first number found
+      String extracted = matches.first.group(1)!;
+      
+      // Trim the first two digits if there are enough digits
+      if (extracted.length > 2) {
+        extracted = extracted.substring(2);
+      }
+      
+      taskNumber = int.tryParse(extracted);
+      print('Extracted number after trimming: $extracted');
+    }
+    
+    // Pattern 2: If no number found, try number words (one, two, etc.)
+    if (taskNumber == null) {
+      final Map<String, int> numberWords = {
+        'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+        'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+        'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+        'sixth': 6, 'seventh': 7, 'eighth': 8, 'ninth': 9, 'tenth': 10,
+      };
+      
+      for (final entry in numberWords.entries) {
+        if (cleanCommand.contains(entry.key)) {
+          taskNumber = entry.value;
+          break;
+        }
+      }
+    }
+    
+    // Pattern 3: Last resort, try to find any digit in the string
+    if (taskNumber == null) {
+      final anyDigitRegex = RegExp(r'(\d+)');
+      final anyDigitMatch = anyDigitRegex.firstMatch(command);
+      if (anyDigitMatch != null) {
+        // Extract the number
+        String extracted = anyDigitMatch.group(1)!;
+        
+        // Trim the first two digits if there are enough digits
+        if (extracted.length > 2) {
+          extracted = extracted.substring(2);
+        }
+        
+        taskNumber = int.tryParse(extracted);
+        print('Last resort extracted number after trimming: $extracted');
+      }
+    }
+    
+    // If a number was found
+    if (taskNumber != null) {
+      final todoModel = Provider.of<TodoModel>(context, listen: false);
+      final int index = taskNumber - 1; // Convert to 0-based index
+      
+      if (index >= 0 && index < todoModel.todos.length) {
+        final todoToDelete = todoModel.todos[index];
+        todoModel.deleteTodo(todoToDelete.id);
+        _speak('Deleted todo number $taskNumber');
+        
+        setState(() {
+          _statusText = 'Deleted todo #$taskNumber';
+          _currentMode = 'none';
+        });
+      } else {
+        _speak('Invalid todo number. Please try again.');
+        setState(() {
+          _statusText = 'Invalid todo number $taskNumber. Valid range is 1 to ${todoModel.todos.length}';
+        });
+      }
+    } else {
+      _speak('No number detected. Please try again.');
+      setState(() {
+        _statusText = 'No number detected in "$command". Please say a number clearly.';
+      });
+    }
+  }
+
+  // Stop listening
+  void _stopListening() async {
+    if (_isListening) {
+      await _speech.stop();
       setState(() {
         _isListening = false;
-        _isContinuousListening = false;
-        _isRecordingTodo = false;
-        _statusText = '';
       });
-      _speak('Voice assistant deactivated');
-    } else {
-      setState(() {
-        _statusText = 'Starting voice assistant...';
-      });
-      _speak('Voice assistant activated. Say "123" to create a new task');
-      _startListening(continuous: true);
+      
+      // Process the result based on the current mode
+      if (_currentMode == 'delete' && _lastWords.isNotEmpty) {
+        _processDeleteCommand(_lastWords);
+      }
+      
+      _currentMode = 'none';
     }
   }
 
@@ -550,6 +683,7 @@ class _AddTodoFormState extends State<AddTodoForm> {
         final todoModel = Provider.of<TodoModel>(context, listen: false);
         await todoModel.addTodo(_controller.text);
         _controller.clear();
+        _speak('Task added successfully');
       } catch (e) {
         // Handle error if needed
         ScaffoldMessenger.of(context).showSnackBar(
@@ -570,6 +704,8 @@ class _AddTodoFormState extends State<AddTodoForm> {
 
   @override
   Widget build(BuildContext context) {
+    final todoModel = Provider.of<TodoModel>(context);
+    
     return Container(
       padding: const EdgeInsets.all(16.0),
       decoration: BoxDecoration(
@@ -591,12 +727,10 @@ class _AddTodoFormState extends State<AddTodoForm> {
                   controller: _controller,
                   decoration: InputDecoration(
                     hintText: _isListening 
-                      ? (_isRecordingTodo ? 'Recording todo...' : 'Listening...') 
+                      ? (_currentMode == 'add' ? 'Listening for task...' : 'Listening for number...') 
                       : 'Add a new task...',
                     hintStyle: TextStyle(
-                      color: _isRecordingTodo 
-                        ? Colors.red.shade400 
-                        : (_isListening ? Colors.green.shade400 : Colors.grey.shade400),
+                      color: _isListening ? Colors.green.shade400 : Colors.grey.shade400,
                     ),
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
@@ -619,62 +753,58 @@ class _AddTodoFormState extends State<AddTodoForm> {
                         : null,
                   ),
                   onSubmitted: (_) => _handleSubmit(),
-                  enabled: !_isSubmitting && !_isRecordingTodo,
+                  enabled: !_isSubmitting && _currentMode != 'delete',
                   onChanged: (_) => setState(() {}),
                 ),
               ),
               const SizedBox(width: 12),
+              // Add task with voice button
               Container(
                 decoration: BoxDecoration(
-                  color: _isContinuousListening
-                      ? Colors.deepPurple.shade400
-                      : (_isListening
-                          ? Colors.green.shade400
-                          : Theme.of(context).colorScheme.secondary),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: IconButton(
-                  onPressed: _speechAvailable ? _toggleContinuousListening : null,
-                  icon: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 300),
-                    child: _isContinuousListening
-                        ? const Icon(
-                            Icons.record_voice_over,
-                            key: ValueKey('continuous'),
-                          )
-                        : const Icon(
-                            Icons.voice_over_off,
-                            key: ValueKey('not_continuous'),
-                          ),
-                  ),
-                  color: Colors.white,
-                  tooltip: _isContinuousListening
-                      ? 'Voice assistant active (tap to deactivate)'
-                      : 'Activate voice assistant',
-                ),
-              ),
-              const SizedBox(width: 12),
-              Container(
-                decoration: BoxDecoration(
-                  color: _isListening && !_isContinuousListening
+                  color: _isListening && _currentMode == 'add'
                       ? Colors.green.shade400
                       : Theme.of(context).colorScheme.secondary,
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: IconButton(
-                  onPressed: _speechAvailable && !_isContinuousListening
-                      ? () => _startListening()
-                      : null,
+                  onPressed: _isListening 
+                      ? _stopListening 
+                      : _speechAvailable ? _startListeningForAddTodo : null,
                   icon: Icon(
-                    _isListening && !_isContinuousListening ? Icons.mic : Icons.mic_none,
+                    _isListening && _currentMode == 'add' ? Icons.stop : Icons.mic,
                   ),
                   color: Colors.white,
-                  tooltip: _isListening && !_isContinuousListening
-                      ? 'Stop listening'
-                      : 'Start voice input',
+                  tooltip: _isListening && _currentMode == 'add'
+                      ? 'Stop recording'
+                      : 'Add task with voice',
                 ),
               ),
               const SizedBox(width: 12),
+              // Delete task with voice button
+              Container(
+                decoration: BoxDecoration(
+                  color: _isListening && _currentMode == 'delete'
+                      ? Colors.red.shade400
+                      : Colors.red.shade300,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: IconButton(
+                  onPressed: _isListening 
+                      ? _stopListening 
+                      : _speechAvailable ? _startListeningForDeleteTodo : null,
+                  icon: Icon(
+                    _isListening && _currentMode == 'delete' 
+                        ? Icons.stop 
+                        : Icons.delete_outline,
+                  ),
+                  color: Colors.white,
+                  tooltip: _isListening && _currentMode == 'delete'
+                      ? 'Stop recording'
+                      : 'Delete task with voice',
+                ),
+              ),
+              const SizedBox(width: 12),
+              // Add task button
               Container(
                 decoration: BoxDecoration(
                   color: _controller.text.trim().isNotEmpty
@@ -709,12 +839,60 @@ class _AddTodoFormState extends State<AddTodoForm> {
               child: Text(
                 _statusText,
                 style: TextStyle(
-                  color: _isRecordingTodo
+                  color: _currentMode == 'delete'
                       ? Colors.red.shade700
                       : (_isListening ? Colors.green.shade700 : Colors.grey.shade600),
                   fontSize: 12,
                   fontStyle: FontStyle.italic,
                 ),
+              ),
+            ),
+          // Show task numbers when in delete mode
+          if (_currentMode == 'delete' && todoModel.todos.isNotEmpty)
+            Container(
+              margin: const EdgeInsets.only(top: 10),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.red.shade200),
+              ),
+              width: double.infinity,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Available task numbers:',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.red.shade700,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: List.generate(
+                      todoModel.todos.length, 
+                      (index) => Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.red.shade300),
+                        ),
+                        child: Text(
+                          '${index + 1}',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: Colors.red.shade700,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
           // Display the raw speech recognition text
@@ -740,7 +918,7 @@ class _AddTodoFormState extends State<AddTodoForm> {
                     ),
                   ),
                   const SizedBox(height: 4),
-                  Text(
+            Text(
                     _rawRecognizedWords,
                     style: TextStyle(
                       fontSize: 14,
@@ -759,8 +937,9 @@ class _AddTodoFormState extends State<AddTodoForm> {
 // Individual todo item
 class TodoItem extends StatefulWidget {
   final Todo todo;
+  final int index;
 
-  const TodoItem({super.key, required this.todo});
+  const TodoItem({super.key, required this.todo, required this.index});
 
   @override
   State<TodoItem> createState() => _TodoItemState();
@@ -976,23 +1155,48 @@ class _TodoItemState extends State<TodoItem> {
         margin: const EdgeInsets.symmetric(vertical: 4),
         child: ListTile(
           contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          leading: _isUpdating
-              ? const SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : Transform.scale(
-                  scale: 1.2,
-                  child: Checkbox(
-                    value: widget.todo.completed,
-                    onChanged: (bool? value) => _handleToggle(),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(4),
+          leading: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Task number indicator
+              Container(
+                margin: const EdgeInsets.only(right: 8),
+                width: 24,
+                height: 24,
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.primary.withOpacity(0.2),
+                  shape: BoxShape.circle,
+                ),
+                child: Center(
+                  child: Text(
+                    '${widget.index}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: Theme.of(context).colorScheme.primary,
                     ),
-                    activeColor: Theme.of(context).colorScheme.primary,
                   ),
                 ),
+              ),
+              _isUpdating
+                ? const SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Transform.scale(
+                    scale: 1.2,
+                    child: Checkbox(
+                      value: widget.todo.completed,
+                      onChanged: (bool? value) => _handleToggle(),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      activeColor: Theme.of(context).colorScheme.primary,
+                    ),
+                  ),
+            ],
+          ),
           title: Text(
             widget.todo.title,
             style: TextStyle(
